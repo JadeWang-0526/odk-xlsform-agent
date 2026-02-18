@@ -237,27 +237,37 @@ def _normalize_language_columns_and_rows(
         if new_key not in updated_columns:
             updated_columns.append(new_key)
 
-    # Track languages present after normalization.
     lang_headers = _language_headers_from_columns(updated_columns)
-
-    # If any constraint_message values exist, propagate them to every language column.
     if lang_headers:
-        has_constraint_values = any(
-            val not in (None, "", " ")
-            for row in updated_rows
-            for key, val in row.items()
-            if str(key).startswith("constraint_message")
-        )
-        if has_constraint_values:
-            for lang in lang_headers:
-                cm_col = f"constraint_message::{lang}"
-                if cm_col not in updated_columns:
-                    updated_columns.append(cm_col)
-                for row in updated_rows:
-                    if cm_col not in row or row.get(cm_col) in (None, "", " "):
-                        fallback = row.get("constraint_message")
-                        if fallback not in (None, "", " "):
-                            row[cm_col] = fallback
+        user_facing_fields = ["label", "hint", "constraint_message", "required_message", "guidance_hint"]
+
+        for field in user_facing_fields:
+            lang_cols = [f"{field}::{lang}" for lang in lang_headers]
+
+            # Ensure language-specific columns exist.
+            for col in lang_cols:
+                if col not in updated_columns:
+                    updated_columns.append(col)
+
+            for row in updated_rows:
+                # Pick a fallback value from any existing language value or the base field.
+                fallback = None
+                for candidate_key in lang_cols + [field]:
+                    val = row.get(candidate_key)
+                    if val not in (None, "", " "):
+                        fallback = val
+                        break
+
+                for col in lang_cols:
+                    if row.get(col) in (None, "", " ") and fallback not in (None, "", " "):
+                        row[col] = fallback
+
+                # Drop the non-language column to avoid a "default" language in ODK.
+                if field in row:
+                    row.pop(field, None)
+
+            # Remove the non-language column from the column list as well.
+            updated_columns = [c for c in updated_columns if c != field]
 
     return updated_columns, updated_rows
 
