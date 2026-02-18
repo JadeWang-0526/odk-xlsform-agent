@@ -172,6 +172,18 @@ def _normalize_languages(languages: Sequence[str]) -> List[Dict[str, str]]:
     return normalized
 
 
+def _language_headers_from_columns(columns: Sequence[str]) -> List[str]:
+    """Extract unique language headers from language-bearing columns."""
+    headers: List[str] = []
+    for col in columns or []:
+        m = re.match(r"^(label|hint|constraint_message)::(.+)$", str(col) or "")
+        if m:
+            header = m.group(2).strip()
+            if header and header not in headers:
+                headers.append(header)
+    return headers
+
+
 def _normalize_language_column_name(col: str) -> str:
     """Normalize language-bearing column names to include the BCP47 code."""
     m = re.match(r"^(label|hint|constraint_message)::\s*(.+)$", col or "")
@@ -224,6 +236,28 @@ def _normalize_language_columns_and_rows(
         new_key = mapping.get(key, key)
         if new_key not in updated_columns:
             updated_columns.append(new_key)
+
+    # Track languages present after normalization.
+    lang_headers = _language_headers_from_columns(updated_columns)
+
+    # If any constraint_message values exist, propagate them to every language column.
+    if lang_headers:
+        has_constraint_values = any(
+            val not in (None, "", " ")
+            for row in updated_rows
+            for key, val in row.items()
+            if str(key).startswith("constraint_message")
+        )
+        if has_constraint_values:
+            for lang in lang_headers:
+                cm_col = f"constraint_message::{lang}"
+                if cm_col not in updated_columns:
+                    updated_columns.append(cm_col)
+                for row in updated_rows:
+                    if cm_col not in row or row.get(cm_col) in (None, "", " "):
+                        fallback = row.get("constraint_message")
+                        if fallback not in (None, "", " "):
+                            row[cm_col] = fallback
 
     return updated_columns, updated_rows
 
@@ -772,17 +806,43 @@ def write_xlsform(
         wb = Workbook()
         wb.remove(wb.active)
 
-    written: List[str] = []
-    for sheet_name, sheet_spec in spec.items():
+    def _prepare_sheet(sheet_name: str, sheet_spec: Dict[str, Any]) -> tuple[List[str], List[Dict[str, Any]]]:
         columns = sheet_spec.get("columns") or []
         rows = sheet_spec.get("rows") or []
         columns = columns or _infer_columns(rows, preferred_copy.get(sheet_name.lower()))
         if not columns:
             columns = ["type", "name", "label"] if sheet_name.lower() == "survey" else ["name", "label"]
-
-        # Normalize language-bearing columns to include IANA codes and update rows accordingly.
+        preferred = preferred_copy.get(sheet_name.lower())
+        if preferred:
+            ordered = [c for c in preferred if c in columns]
+            ordered.extend(c for c in columns if c not in ordered)
+            columns = ordered
         columns, rows = _normalize_language_columns_and_rows(columns, rows)
+        return columns, rows
 
+    normalized_sheets: Dict[str, tuple[List[str], List[Dict[str, Any]]]] = {}
+    survey_languages: List[str] = []
+    for sheet_name, sheet_spec in spec.items():
+        if sheet_name.lower() == "settings":
+            continue
+        columns, rows = _prepare_sheet(sheet_name, sheet_spec)
+        if sheet_name.lower() == "survey":
+            survey_languages = _language_headers_from_columns(columns)
+        normalized_sheets[sheet_name] = (columns, rows)
+
+    if "settings" in spec:
+        settings_spec = spec["settings"]
+        settings_rows = settings_spec.get("rows") or []
+        if survey_languages:
+            for row in settings_rows:
+                if not row.get("default_language"):
+                    row["default_language"] = survey_languages[0]
+        settings_columns = settings_spec.get("columns") or _PREFERRED_COLUMN_ORDER["settings"]
+        settings_columns, settings_rows = _normalize_language_columns_and_rows(settings_columns, settings_rows)
+        normalized_sheets["settings"] = (settings_columns, settings_rows)
+
+    written: List[str] = []
+    for sheet_name, (columns, rows) in normalized_sheets.items():
         # Reuse the existing template sheet (clearing its rows) or create new.
         if sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -922,6 +982,7 @@ You are odk_xlsform_agent. Help users design or edit ODK XLSForms step by step.
 - **Never include `label::<Language (code)>` columns if they will be empty.** Only include language columns that are actually populated. Empty language or media columns cause upload errors in ODK.
 - The user can choose **any** languages they want — there is no fixed list. Pass the language names to `new_form_spec(languages=...)` and `design_survey_outline(languages=...)` to set up the correct `label::<Language (code)>` column structure (language names are normalized to include their IANA subtags).
 - The tools create all `label::<Language (code)>` values as **English placeholders**. **You MUST translate every `label::<Language (code)>` value into the correct language before calling `write_xlsform` or `save_xlsform_draft`.** For example, if languages are English and French, set `label::English (en)` to the English text and `label::French (fr)` to the proper French translation. Do this for survey rows AND choices rows. You are an LLM — use your language abilities to produce accurate translations.
+- Before saving or sharing any spec or XLSX, double-check that every language-bearing column includes the code suffix (e.g., `label::English (en)`) and normalize/fix it if missing.
 - A language-selector question (`select_one form_language`) is automatically added at the start of the form when languages are specified.
 - Set `default_language` in the settings sheet to the first language in the list.
 
