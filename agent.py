@@ -1,7 +1,10 @@
+
+
 from __future__ import annotations
 
 import copy
 import datetime
+import re
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -50,6 +53,62 @@ _TEMPLATE_URL = (
 )
 _TEMPLATE_CACHE_PATH = Path(tempfile.gettempdir()) / "odk_xlsform_template.xlsx"
 
+# Common language names mapped to their BCP 47 / IANA subtags.
+_CANONICAL_LANGUAGE_CODES: Dict[str, str] = {
+    "Arabic": "ar",
+    "Bengali": "bn",
+    "Bulgarian": "bg",
+    "Chinese": "zh",
+    "Croatian": "hr",
+    "Czech": "cs",
+    "Danish": "da",
+    "Dutch": "nl",
+    "English": "en",
+    "Finnish": "fi",
+    "French": "fr",
+    "German": "de",
+    "Greek": "el",
+    "Hebrew": "he",
+    "Hindi": "hi",
+    "Hungarian": "hu",
+    "Indonesian": "id",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Malay": "ms",
+    "Norwegian": "no",
+    "Persian": "fa",
+    "Polish": "pl",
+    "Portuguese": "pt",
+    "Romanian": "ro",
+    "Russian": "ru",
+    "Serbian": "sr",
+    "Somali": "so",
+    "Spanish": "es",
+    "Swahili": "sw",
+    "Swedish": "sv",
+    "Thai": "th",
+    "Turkish": "tr",
+    "Ukrainian": "uk",
+    "Urdu": "ur",
+    "Vietnamese": "vi",
+}
+_LANGUAGE_CODE_MAP: Dict[str, str] = {name.lower(): code for name, code in _CANONICAL_LANGUAGE_CODES.items()}
+_LANGUAGE_CODE_MAP.update(
+    {
+        "farsi": "fa",
+        "filipino": "fil",
+        "kiswahili": "sw",
+        "mandarin": "zh",
+        "pashto": "ps",
+        "swahili": "sw",
+        "tagalog": "tl",
+    }
+)
+_CODE_TO_NAME: Dict[str, str] = {}
+for name, code in _CANONICAL_LANGUAGE_CODES.items():
+    _CODE_TO_NAME.setdefault(code, name)
+
 
 def _get_template_path() -> Optional[Path]:
     """Download the official ODK XLSForm template, caching it in the system temp dir."""
@@ -67,6 +126,50 @@ def _safe_form_id(title: str) -> str:
     cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in title).strip("_")
     cleaned = "_".join(part for part in cleaned.split("_") if part)
     return cleaned or "odk_form"
+
+
+def _normalize_language_tag(language: str) -> Dict[str, str]:
+    """Return name/code/header fields for an input language string."""
+    lang = (language or "").strip()
+    if not lang:
+        return {"header": "", "code": "", "name": ""}
+
+    paren_match = re.match(r"^(.*?)(?:\s*\(([^)]+)\))\s*$", lang)
+    if paren_match:
+        name, code = paren_match.groups()
+        name = name.strip()
+        code = code.strip()
+        normalized_code = code.lower()
+        name = name or _CODE_TO_NAME.get(normalized_code, normalized_code)
+        return {"header": f"{name} ({normalized_code})", "code": normalized_code, "name": name}
+
+    key = lang.lower()
+    if key in _LANGUAGE_CODE_MAP:
+        code = _LANGUAGE_CODE_MAP[key]
+        name = _CODE_TO_NAME.get(code, lang.strip() or code)
+        return {"header": f"{name} ({code})", "code": code, "name": name}
+
+    if re.fullmatch(r"[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*", lang):
+        code = lang.lower()
+        name = _CODE_TO_NAME.get(code, lang)
+        return {"header": f"{name} ({code})", "code": code, "name": name}
+
+    safe_code = "".join(ch.lower() for ch in lang if ch.isalnum() or ch == "-") or "und"
+    name = lang
+    return {"header": f"{name} ({safe_code})", "code": safe_code, "name": name}
+
+
+def _normalize_languages(languages: Sequence[str]) -> List[Dict[str, str]]:
+    """Normalize a list of language names to include IANA codes."""
+    normalized: List[Dict[str, str]] = []
+    seen_headers: set[str] = set()
+    for lang in languages or []:
+        entry = _normalize_language_tag(lang)
+        header = entry.get("header")
+        if header and header not in seen_headers:
+            seen_headers.add(header)
+            normalized.append(entry)
+    return normalized
 
 
 def _row_has_content(values: Sequence[Any]) -> bool:
@@ -172,10 +275,10 @@ def design_survey_outline(
     Returns a structure ready to merge into a form spec: survey rows and choices rows.
 
     When *languages* is provided (e.g. ``["English", "French"]``), the output
-    uses ``label::English``, ``label::French``, etc. instead of a plain
+    uses ``label::English (en)``, ``label::French (fr)``, etc. instead of a plain
     ``label`` column so that ODK renders a multi-language form.  All labels
     are initially set to the English text as placeholders.  **The agent must
-    translate every ``label::<Language>`` value into the correct language
+    translate every ``label::<Language (code)>`` value into the correct language
     before writing the XLSX.**
 
     A language-selector question (``select_one form_language``) is
@@ -183,26 +286,27 @@ def design_survey_outline(
     language at the start of the form.
     """
     objectives = objectives or []
-    languages = languages or []
+    normalized_languages = _normalize_languages(languages or [])
+    language_headers = [entry["header"] for entry in normalized_languages]
 
     # --- label / hint helpers ---
     # When multilingual, every label::<lang> is set to the English text.
     # The LLM agent is responsible for translating these before saving.
     def _label(text: str) -> Dict[str, str]:
-        if not languages:
+        if not language_headers:
             return {"label": text}
-        return {f"label::{lang}": text for lang in languages}
+        return {f"label::{lang}": text for lang in language_headers}
 
     def _hint(text: str) -> Dict[str, str]:
-        if not languages:
+        if not language_headers:
             return {"hint": text}
-        return {f"hint::{lang}": text for lang in languages}
+        return {f"hint::{lang}": text for lang in language_headers}
 
     survey_rows: List[Dict[str, Any]] = []
     choices_rows: List[Dict[str, Any]] = []
 
     # --- language selector (only when multilingual) ---
-    if languages:
+    if normalized_languages:
         survey_rows.append(
             {
                 "type": "select_one form_language",
@@ -211,9 +315,10 @@ def design_survey_outline(
                 "required": "yes",
             }
         )
-        for lang in languages:
+        for entry in normalized_languages:
+            lang_value = entry["code"] or _safe_form_id(entry["header"])
             choices_rows.append(
-                {"list_name": "form_language", "name": lang.lower(), **_label(lang)}
+                {"list_name": "form_language", "name": lang_value, **_label(entry["name"])}
             )
 
     if include_demographics:
@@ -294,6 +399,7 @@ def design_survey_outline(
         ]
     )
 
+    languages = language_headers
     return {
         "topic": topic,
         "objectives": objectives,
@@ -453,34 +559,36 @@ def new_form_spec(
     Build a starter form spec with blank survey/choices sheets and basic settings.
 
     When *languages* is provided (e.g. ``["English", "French"]``), the survey
-    and choices column lists include ``label::<lang>`` columns for each
-    language, and the settings ``default_language`` is set to the first
-    language.  A language-selector question is added to the survey sheet.
+    and choices column lists include ``label::<Language (code)>`` columns for each
+    language (e.g., ``label::English (en)``), and the settings ``default_language``
+    is set to the first language.  A language-selector question is added to the
+    survey sheet.
 
     The returned structure matches what `write_xlsform(...)` expects.
     """
     form_id = form_id or _safe_form_id(form_title)
     version = version or datetime.datetime.now().strftime("%Y%m%d%H%M")
-    languages = languages or []
+    normalized_languages = _normalize_languages(languages or [])
+    language_headers = [entry["header"] for entry in normalized_languages]
 
     # Build column lists — only include label::<lang> when languages are given.
     survey_cols = list(_PREFERRED_COLUMN_ORDER["survey"])
     choices_cols = list(_PREFERRED_COLUMN_ORDER["choices"])
-    if languages:
-        default_language = languages[0]
+    if language_headers:
+        default_language = language_headers[0]
         # Insert label::<lang> columns right after "label" (or replace it)
         for col_list in (survey_cols, choices_cols):
             idx = col_list.index("label")
-            lang_cols = [f"label::{lang}" for lang in languages]
+            lang_cols = [f"label::{lang}" for lang in language_headers]
             col_list[idx:idx + 1] = lang_cols
 
     survey_rows: List[Dict[str, Any]] = []
     choices_rows: List[Dict[str, Any]] = []
 
     # Add language selector when multilingual
-    if languages:
+    if language_headers:
         def _label(text: str) -> Dict[str, str]:
-            return {f"label::{lang}": text for lang in languages}
+            return {f"label::{lang}": text for lang in language_headers}
 
         survey_rows.append(
             {
@@ -490,9 +598,10 @@ def new_form_spec(
                 "required": "yes",
             }
         )
-        for lang in languages:
+        for entry in normalized_languages:
+            lang_value = entry["code"] or _safe_form_id(entry["header"])
             choices_rows.append(
-                {"list_name": "form_language", "name": lang.lower(), **_label(lang)}
+                {"list_name": "form_language", "name": lang_value, **_label(entry["name"])}
             )
 
     return {
@@ -747,13 +856,13 @@ You are odk_xlsform_agent. Help users design or edit ODK XLSForms step by step.
 
 ## Getting started
 - Start by asking whether they want to create a new form or modify an existing one. If modifying, load it with `load_xlsform(...)` and summarize what you find before changing anything.
-- **Always ask which languages the form should support.** Supported languages include English, French, Spanish, Portuguese, Arabic, Swahili, and Chinese. When the user picks languages, pass them as the `languages` parameter to `new_form_spec(...)` and `design_survey_outline(...)`.
+- **Always ask which languages the form should support.** Supported languages include English, French, German, Spanish, Portuguese, Arabic, Swahili, Chinese, etc. When the user picks languages, pass them as the `languages` parameter to `new_form_spec(...)` and `design_survey_outline(...)`.
 
 ## Multi-language support
-- When languages are specified, use `label::<Language>` columns (e.g. `label::English`, `label::French`) instead of a plain `label` column. The same applies to `hint::<Language>` and `constraint_message::<Language>`.
-- **Never include `label::<Language>` columns if they will be empty.** Only include language columns that are actually populated. Empty language or media columns cause upload errors in ODK.
-- The user can choose **any** languages they want — there is no fixed list. Pass the language names to `new_form_spec(languages=...)` and `design_survey_outline(languages=...)` to set up the correct `label::<Language>` column structure.
-- The tools create all `label::<Language>` values as **English placeholders**. **You MUST translate every `label::<Language>` value into the correct language before calling `write_xlsform` or `save_xlsform_draft`.** For example, if languages are English and French, set `label::English` to the English text and `label::French` to the proper French translation. Do this for survey rows AND choices rows. You are an LLM — use your language abilities to produce accurate translations.
+- When languages are specified, use `label::<Language (code)>` columns (e.g. `label::English (en)`, `label::French (fr)`) instead of a plain `label` column. The same applies to `hint::<Language (code)>` and `constraint_message::<Language (code)>`.
+- **Never include `label::<Language (code)>` columns if they will be empty.** Only include language columns that are actually populated. Empty language or media columns cause upload errors in ODK.
+- The user can choose **any** languages they want — there is no fixed list. Pass the language names to `new_form_spec(languages=...)` and `design_survey_outline(languages=...)` to set up the correct `label::<Language (code)>` column structure (language names are normalized to include their IANA subtags).
+- The tools create all `label::<Language (code)>` values as **English placeholders**. **You MUST translate every `label::<Language (code)>` value into the correct language before calling `write_xlsform` or `save_xlsform_draft`.** For example, if languages are English and French, set `label::English (en)` to the English text and `label::French (fr)` to the proper French translation. Do this for survey rows AND choices rows. You are an LLM — use your language abilities to produce accurate translations.
 - A language-selector question (`select_one form_language`) is automatically added at the start of the form when languages are specified.
 - Set `default_language` in the settings sheet to the first language in the list.
 
@@ -770,10 +879,10 @@ You are odk_xlsform_agent. Help users design or edit ODK XLSForms step by step.
 
 ## Saving / exporting
 - When the user confirms or asks to save/export, call `save_xlsform_draft(...)` (or `write_xlsform(...)`) to emit an XLSX; default to a timestamped filename if none is provided and report the path back. Every generated file is automatically based on the official ODK XLSForm Template (https://github.com/getodk/xlsform-template) so it inherits proper structure and formatting.
-- **Only include columns that have data.** Empty columns (especially `media::image`, `media::audio`, `media::video`, and unpopulated `label::<Language>` columns) cause ODK validation errors and must not be written.
+- **Only include columns that have data.** Empty columns (especially `media::image`, `media::audio`, `media::video`, and unpopulated `label::<Language (code)>` columns) cause ODK validation errors and must not be written.
 
 ## Column conventions
-- Follow XLSForm column conventions: type/name/label, language-specific labels (label::English only when that language is in use), hints, required, relevant, constraint and constraint_message, calculation, appearance, choice_filter, repeat_count, default.
+- Follow XLSForm column conventions: type/name/label, language-specific labels (label::English (en) only when that language is in use), hints, required, relevant, constraint and constraint_message, calculation, appearance, choice_filter, repeat_count, default.
 - Only include media columns (media::image, media::audio, media::video) when media files are actually referenced.
 - For select_one/select_multiple questions, always ensure the matching choice list exists and is spelled correctly.
 - Decide and support groups/repeats via begin_group/end_group and begin_repeat/end_repeat rows; keep grouping balanced.
