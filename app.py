@@ -98,6 +98,68 @@ def _extract_xlsx_paths(text: str) -> list[str]:
     return re.findall(r"[\w/\\._-]+\.xlsx", text)
 
 
+def _extract_xlsx_paths_from_obj(obj) -> list[str]:
+    """Best-effort extractor that looks for .xlsx paths in arbitrary tool results."""
+    paths: list[str] = []
+    seen_ids: set[int] = set()
+
+    def _walk(value) -> None:
+        if value is None:
+            return
+        if id(value) in seen_ids:
+            return
+        seen_ids.add(id(value))
+
+        # Strings / Paths
+        if isinstance(value, (str, os.PathLike)):
+            paths.extend(_extract_xlsx_paths(str(value)))
+            return
+
+        # Collections
+        if isinstance(value, dict):
+            for v in value.values():
+                _walk(v)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for v in value:
+                _walk(v)
+            return
+
+        # Attributes commonly used in tool results
+        for attr in (
+            "output_path",
+            "path",
+            "file_path",
+            "filepath",
+            "result",
+            "text",
+            "content",
+        ):
+            if hasattr(value, attr):
+                try:
+                    _walk(getattr(value, attr))
+                except Exception:
+                    pass
+
+        # Fallback to string representation
+        try:
+            paths.extend(_extract_xlsx_paths(str(value)))
+        except Exception:
+            pass
+
+    _walk(obj)
+    return paths
+
+
+def _remember_xlsx_path(path: str) -> None:
+    """Normalize and store a discovered XLSX path if it exists."""
+    p = Path(path).expanduser().resolve()
+    if p.exists():
+        normalized = str(p)
+        if normalized not in st.session_state.xlsx_files:
+            st.session_state.xlsx_files.append(normalized)
+
+
 async def _ensure_session():
     """Create the ADK session if it doesn't exist yet."""
     session_id = st.session_state.session_id
@@ -123,6 +185,7 @@ async def _run_agent(user_input: str) -> str:
         parts=[types.Part(text=user_input)],
     )
     response_text = ""
+    tool_messages: list[str] = []
     async for event in runner.run_async(
         user_id=st.session_state.user_id,
         session_id=st.session_state.session_id,
@@ -138,15 +201,36 @@ async def _run_agent(user_input: str) -> str:
         if hasattr(event, "actions") and event.actions:
             tool_results = event.actions.tool_results if hasattr(event.actions, "tool_results") else []
             for result in tool_results:
+                for path in _extract_xlsx_paths_from_obj(result):
+                    _remember_xlsx_path(path)
+                # Capture any text/result content so the user sees a meaningful reply
+                msg = None
                 if hasattr(result, "text") and result.text:
-                    for path in _extract_xlsx_paths(result.text):
-                        if Path(path).exists() and path not in st.session_state.xlsx_files:
-                            st.session_state.xlsx_files.append(path)
+                    msg = str(result.text)
+                elif hasattr(result, "result") and result.result not in (None, ""):
+                    msg = str(result.result)
+                elif hasattr(result, "output") and result.output not in (None, ""):
+                    msg = str(result.output)
+                else:
+                    # Fallback to repr if nothing else is available
+                    try:
+                        msg = str(result)
+                    except Exception:
+                        msg = None
+                if msg and msg.strip():
+                    tool_messages.append(msg.strip())
 
     # Also scan the response text for xlsx paths
     for path in _extract_xlsx_paths(response_text):
-        if Path(path).exists() and path not in st.session_state.xlsx_files:
-            st.session_state.xlsx_files.append(path)
+        _remember_xlsx_path(path)
+
+    # If the agent produced no text, surface tool output or saved file info to avoid empty replies
+    if not response_text.strip():
+        if tool_messages:
+            response_text = "\n".join(tool_messages)
+        elif st.session_state.xlsx_files:
+            latest = st.session_state.xlsx_files[-1]
+            response_text = f"Saved draft: {Path(latest).name}"
 
     return response_text
 
