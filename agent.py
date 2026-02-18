@@ -172,6 +172,62 @@ def _normalize_languages(languages: Sequence[str]) -> List[Dict[str, str]]:
     return normalized
 
 
+def _normalize_language_column_name(col: str) -> str:
+    """Normalize language-bearing column names to include the BCP47 code."""
+    m = re.match(r"^(label|hint|constraint_message)::\s*(.+)$", col or "")
+    if not m:
+        return col
+    prefix, lang_part = m.groups()
+    normalized = _normalize_language_tag(lang_part)
+    header = normalized.get("header")
+    return f"{prefix}::{header}" if header else col
+
+
+def _normalize_language_columns_and_rows(
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+) -> tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Ensure any label/hint/constraint_message language columns include the code,
+    updating both the column list and row keys in place-safe copies.
+    """
+    all_keys = set(columns)
+    for row in rows:
+        all_keys.update(row.keys())
+
+    mapping: Dict[str, str] = {}
+    for key in all_keys:
+        new_key = _normalize_language_column_name(key)
+        mapping[key] = new_key or key
+
+    updated_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        new_row: Dict[str, Any] = {}
+        for key, val in row.items():
+            new_key = mapping.get(key, key)
+            if new_key in new_row:
+                # Prefer the non-empty value when a collision occurs.
+                if new_row[new_key] in (None, "", " ") and val not in (None, "", " "):
+                    new_row[new_key] = val
+            else:
+                new_row[new_key] = val
+        updated_rows.append(new_row)
+
+    updated_columns: List[str] = []
+    for col in columns:
+        new_col = mapping.get(col, col)
+        if new_col not in updated_columns:
+            updated_columns.append(new_col)
+
+    # Include any normalized keys present in rows but missing from columns.
+    for key in all_keys:
+        new_key = mapping.get(key, key)
+        if new_key not in updated_columns:
+            updated_columns.append(new_key)
+
+    return updated_columns, updated_rows
+
+
 def _row_has_content(values: Sequence[Any]) -> bool:
     return any(val not in (None, "", " ") for val in values)
 
@@ -723,6 +779,9 @@ def write_xlsform(
         columns = columns or _infer_columns(rows, preferred_copy.get(sheet_name.lower()))
         if not columns:
             columns = ["type", "name", "label"] if sheet_name.lower() == "survey" else ["name", "label"]
+
+        # Normalize language-bearing columns to include IANA codes and update rows accordingly.
+        columns, rows = _normalize_language_columns_and_rows(columns, rows)
 
         # Reuse the existing template sheet (clearing its rows) or create new.
         if sheet_name in wb.sheetnames:
