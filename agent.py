@@ -23,13 +23,16 @@ _PREFERRED_COLUMN_ORDER: Dict[str, List[str]] = {
         "required",
         "relevant",
         "appearance",
-        "choice_filter",
+        "default",
         "constraint",
         "constraint_message",
         "calculation",
+        "choice_filter",
         "repeat_count",
-        "default",
         "autoplay",
+        "image",
+        "audio",
+        "video",
     ],
     "choices": [
         "list_name",
@@ -141,22 +144,22 @@ def _normalize_language_tag(language: str) -> Dict[str, str]:
         code = code.strip()
         normalized_code = code.lower()
         name = name or _CODE_TO_NAME.get(normalized_code, normalized_code)
-        return {"header": f"{name} ({normalized_code})", "code": normalized_code, "name": name}
+        return {"header": f"{name}({normalized_code})", "code": normalized_code, "name": name}
 
     key = lang.lower()
     if key in _LANGUAGE_CODE_MAP:
         code = _LANGUAGE_CODE_MAP[key]
         name = _CODE_TO_NAME.get(code, lang.strip() or code)
-        return {"header": f"{name} ({code})", "code": code, "name": name}
+        return {"header": f"{name}({code})", "code": code, "name": name}
 
     if re.fullmatch(r"[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*", lang):
         code = lang.lower()
         name = _CODE_TO_NAME.get(code, lang)
-        return {"header": f"{name} ({code})", "code": code, "name": name}
+        return {"header": f"{name}({code})", "code": code, "name": name}
 
     safe_code = "".join(ch.lower() for ch in lang if ch.isalnum() or ch == "-") or "und"
     name = lang
-    return {"header": f"{name} ({safe_code})", "code": safe_code, "name": name}
+    return {"header": f"{name}({safe_code})", "code": safe_code, "name": name}
 
 
 def _normalize_languages(languages: Sequence[str]) -> List[Dict[str, str]]:
@@ -176,7 +179,7 @@ def _language_headers_from_columns(columns: Sequence[str]) -> List[str]:
     """Extract unique language headers from language-bearing columns."""
     headers: List[str] = []
     for col in columns or []:
-        m = re.match(r"^(label|hint|constraint_message)::(.+)$", str(col) or "")
+        m = re.match(r"^(label|hint|constraint_message|required_message|guidance_hint|image|audio|video)::(.+)$", str(col) or "")
         if m:
             header = m.group(2).strip()
             if header and header not in headers:
@@ -186,7 +189,7 @@ def _language_headers_from_columns(columns: Sequence[str]) -> List[str]:
 
 def _normalize_language_column_name(col: str) -> str:
     """Normalize language-bearing column names to include the BCP47 code."""
-    m = re.match(r"^(label|hint|constraint_message)::\s*(.+)$", col or "")
+    m = re.match(r"^(label|hint|constraint_message|required_message|guidance_hint|image|audio|video)::\s*(.+)$", col or "")
     if not m:
         return col
     prefix, lang_part = m.groups()
@@ -239,35 +242,61 @@ def _normalize_language_columns_and_rows(
 
     lang_headers = _language_headers_from_columns(updated_columns)
     if lang_headers:
-        user_facing_fields = ["label", "hint", "constraint_message", "required_message", "guidance_hint"]
+        # Text fields: fallback value copied to empty language columns.
+        text_fields = ["label", "hint", "constraint_message", "required_message", "guidance_hint"]
+        # Media fields: columns always created for each language but left empty
+        # (each language may reference a different media file).
+        media_fields = ["image", "audio", "video"]
+        user_facing_fields = text_fields + media_fields
 
+        col_set_now = set(updated_columns)
         for field in user_facing_fields:
             lang_cols = [f"{field}::{lang}" for lang in lang_headers]
+            lang_col_set = set(lang_cols)
 
-            # Ensure language-specific columns exist.
-            for col in lang_cols:
-                if col not in updated_columns:
-                    updated_columns.append(col)
+            # Only expand a field to language variants if the field (base column)
+            # or any of its language variants is actually present in this sheet's
+            # columns or row data.  This prevents, for example, hint/image/audio/video
+            # columns from being auto-created on the choices sheet where they don't belong.
+            field_present = field in col_set_now or any(c in col_set_now for c in lang_col_set)
+            if not field_present:
+                continue
+
+            # Remove any existing lang variants (they may have been inserted in
+            # non-deterministic order from the row-key collection step above),
+            # then re-insert in the correct lang_headers order.
+            first_idx = next(
+                (i for i, c in enumerate(updated_columns) if c in lang_col_set), None
+            )
+            updated_columns = [c for c in updated_columns if c not in lang_col_set]
+            if first_idx is not None:
+                for offset, col in enumerate(lang_cols):
+                    updated_columns.insert(first_idx + offset, col)
+            else:
+                updated_columns.extend(lang_cols)
+            col_set_now = set(updated_columns)
 
             for row in updated_rows:
-                # Pick a fallback value from any existing language value or the base field.
-                fallback = None
-                for candidate_key in lang_cols + [field]:
-                    val = row.get(candidate_key)
-                    if val not in (None, "", " "):
-                        fallback = val
-                        break
+                if field in text_fields:
+                    # Pick a fallback value from any existing language value or the base field.
+                    fallback = None
+                    for candidate_key in lang_cols + [field]:
+                        val = row.get(candidate_key)
+                        if val not in (None, "", " "):
+                            fallback = val
+                            break
 
-                for col in lang_cols:
-                    if row.get(col) in (None, "", " ") and fallback not in (None, "", " "):
-                        row[col] = fallback
+                    for col in lang_cols:
+                        if row.get(col) in (None, "", " ") and fallback not in (None, "", " "):
+                            row[col] = fallback
 
                 # Drop the non-language column to avoid a "default" language in ODK.
                 if field in row:
                     row.pop(field, None)
 
-            # Remove the non-language column from the column list as well.
+            # Remove the non-language base column from the column list as well.
             updated_columns = [c for c in updated_columns if c != field]
+            col_set_now = set(updated_columns)
 
     return updated_columns, updated_rows
 
@@ -307,12 +336,22 @@ def _normalize_form_spec(form_spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
     return normalized
 
 
+_LANG_COL_RE = re.compile(
+    r"^(label|hint|constraint_message|required_message|guidance_hint|image|audio|video)::.+"
+)
+
+
 def _columns_with_data(columns: List[str], rows: List[Dict[str, Any]]) -> List[str]:
-    """Return only the columns that have at least one non-empty value in the rows."""
+    """Return columns that have data. Language-bearing user-facing columns are always
+    included even when empty so that multi-language XLSX files have a consistent
+    structure (ODK requires all language columns to be present)."""
     if not rows:
         return columns
     populated: List[str] = []
     for col in columns:
+        if _LANG_COL_RE.match(col):
+            populated.append(col)  # always keep — may be legitimately empty
+            continue
         for row in rows:
             val = row.get(col)
             if val not in (None, "", " "):
@@ -822,12 +861,28 @@ def write_xlsform(
         columns = columns or _infer_columns(rows, preferred_copy.get(sheet_name.lower()))
         if not columns:
             columns = ["type", "name", "label"] if sheet_name.lower() == "survey" else ["name", "label"]
+        # Normalize language columns first so language-variant columns (label::lang)
+        # are created before we apply preferred ordering.
+        columns, rows = _normalize_language_columns_and_rows(columns, rows)
         preferred = preferred_copy.get(sheet_name.lower())
         if preferred:
-            ordered = [c for c in preferred if c in columns]
-            ordered.extend(c for c in columns if c not in ordered)
+            col_set = set(columns)
+            placed: set[str] = set()
+            ordered: List[str] = []
+            for pref_col in preferred:
+                if pref_col in col_set and pref_col not in placed:
+                    ordered.append(pref_col)
+                    placed.add(pref_col)
+                # Expand base column to its language variants in order
+                lang_variants = [c for c in columns if c.startswith(f"{pref_col}::") and c not in placed]
+                for lv in lang_variants:
+                    ordered.append(lv)
+                    placed.add(lv)
+            # Append anything not already placed (unknown/extra columns)
+            for col in columns:
+                if col not in placed:
+                    ordered.append(col)
             columns = ordered
-        columns, rows = _normalize_language_columns_and_rows(columns, rows)
         return columns, rows
 
     normalized_sheets: Dict[str, tuple[List[str], List[Dict[str, Any]]]] = {}
@@ -988,11 +1043,11 @@ You are odk_xlsform_agent. Help users design or edit ODK XLSForms step by step.
 - **Always ask which languages the form should support.** Supported languages include English, French, German, Spanish, Portuguese, Arabic, Swahili, Chinese, etc. When the user picks languages, pass them as the `languages` parameter to `new_form_spec(...)` and `design_survey_outline(...)`.
 
 ## Multi-language support
-- When languages are specified, use `label::<Language (code)>` columns (e.g. `label::English (en)`, `label::French (fr)`) instead of a plain `label` column. The same applies to `hint::<Language (code)>` and `constraint_message::<Language (code)>`.
-- **Never include `label::<Language (code)>` columns if they will be empty.** Only include language columns that are actually populated. Empty language or media columns cause upload errors in ODK.
-- The user can choose **any** languages they want — there is no fixed list. Pass the language names to `new_form_spec(languages=...)` and `design_survey_outline(languages=...)` to set up the correct `label::<Language (code)>` column structure (language names are normalized to include their IANA subtags).
-- The tools create all `label::<Language (code)>` values as **English placeholders**. **You MUST translate every `label::<Language (code)>` value into the correct language before calling `write_xlsform` or `save_xlsform_draft`.** For example, if languages are English and French, set `label::English (en)` to the English text and `label::French (fr)` to the proper French translation. Do this for survey rows AND choices rows. You are an LLM — use your language abilities to produce accurate translations.
-- Before saving or sharing any spec or XLSX, double-check that every language-bearing column includes the code suffix (e.g., `label::English (en)`) and normalize/fix it if missing.
+- When languages are specified, use `label::<Language(code)>` columns (e.g. `label::English(en)`, `label::French(fr)`) instead of a plain `label` column. Language codes follow the IANA language subtag registry (e.g. `en`, `fr`, `zh`, `ar`, `sw`). The format is always `LanguageName(code)` — **no space** between the language name and the opening parenthesis.
+- **All user-facing columns must be multilingual when languages are specified.** This includes `label`, `hint`, `constraint_message`, `required_message`, `guidance_hint`, `image`, `audio`, and `video`. All these columns **must always be written for every language**, even if the value is empty. ODK requires the full column set to be present for proper language switching.
+- The user can choose **any** languages they want — there is no fixed list. Pass the language names to `new_form_spec(languages=...)` and `design_survey_outline(languages=...)` to set up the correct `label::<Language(code)>` column structure (language names are normalized to include their IANA subtags).
+- The tools create all `label::<Language(code)>` values as **English placeholders**. **You MUST translate every `label::<Language(code)>` value into the correct language before calling `write_xlsform` or `save_xlsform_draft`.** For example, if languages are English and French, set `label::English(en)` to the English text and `label::French(fr)` to the proper French translation. Do this for survey rows AND choices rows. You are an LLM — use your language abilities to produce accurate translations.
+- Before saving or sharing any spec or XLSX, double-check that every language-bearing column includes the code suffix (e.g., `label::English(en)`) and normalize/fix it if missing.
 - A language-selector question (`select_one form_language`) is automatically added at the start of the form when languages are specified.
 - Set `default_language` in the settings sheet to the first language in the list.
 
@@ -1009,11 +1064,11 @@ You are odk_xlsform_agent. Help users design or edit ODK XLSForms step by step.
 
 ## Saving / exporting
 - When the user confirms or asks to save/export, call `save_xlsform_draft(...)` (or `write_xlsform(...)`) to emit an XLSX; default to a timestamped filename if none is provided and report the path back. Every generated file is automatically based on the official ODK XLSForm Template (https://github.com/getodk/xlsform-template) so it inherits proper structure and formatting.
-- **Only include columns that have data.** Empty columns (especially `media::image`, `media::audio`, `media::video`, and unpopulated `label::<Language (code)>` columns) cause ODK validation errors and must not be written.
+- For multilingual forms, **all** user-facing language columns (`label::`, `hint::`, `constraint_message::`, `image::`, `audio::`, `video::` for every language) are written to the XLSX regardless of whether they contain data. This is handled automatically by the tools.
 
 ## Column conventions
-- Follow XLSForm column conventions: type/name/label, language-specific labels (label::English (en) only when that language is in use), hints, required, relevant, constraint and constraint_message, calculation, appearance, choice_filter, repeat_count, default.
-- Only include media columns (media::image, media::audio, media::video) when media files are actually referenced.
+- Follow XLSForm column conventions: type/name/label, language-specific labels (e.g. `label::English(en)` — note no space before the parenthesis), hints, required, relevant, constraint and constraint_message, calculation, appearance, choice_filter, repeat_count, default.
+- When multilingual, use `image::Language(code)`, `audio::Language(code)`, `video::Language(code)` columns for every active language; leave them empty if no media file is referenced for that language.
 - For select_one/select_multiple questions, always ensure the matching choice list exists and is spelled correctly.
 - Decide and support groups/repeats via begin_group/end_group and begin_repeat/end_repeat rows; keep grouping balanced.
 - If something seems ambiguous or risky, ask clarifying questions instead of guessing.
