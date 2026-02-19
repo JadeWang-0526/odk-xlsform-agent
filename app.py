@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -24,7 +25,7 @@ from agent import root_agent
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="ODK XLSForm Agent", page_icon="📋", layout="wide")
 st.title("ODK XLSForm Agent")
-st.caption("Design and generate ODK XLSForm surveys through chat.")
+st.caption("Design and generate ODK XLSForm through chat.")
 
 # ---------------------------------------------------------------------------
 # ADK runner (cached so it persists across reruns)
@@ -84,13 +85,6 @@ with st.sidebar:
                 )
 
 # ---------------------------------------------------------------------------
-# Display chat history
-# ---------------------------------------------------------------------------
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _extract_xlsx_paths(text: str) -> list[str]:
@@ -98,24 +92,20 @@ def _extract_xlsx_paths(text: str) -> list[str]:
     return re.findall(r"[\w/\\._-]+\.xlsx", text)
 
 
-def _extract_xlsx_paths_from_obj(obj) -> list[str]:
-    """Best-effort extractor that looks for .xlsx paths in arbitrary tool results."""
+def _extract_xlsx_paths_from_obj(obj: Any) -> list[str]:
+    """Best-effort extractor that looks for .xlsx paths in arbitrary objects."""
     paths: list[str] = []
     seen_ids: set[int] = set()
 
-    def _walk(value) -> None:
+    def _walk(value: Any) -> None:
         if value is None:
             return
         if id(value) in seen_ids:
             return
         seen_ids.add(id(value))
-
-        # Strings / Paths
         if isinstance(value, (str, os.PathLike)):
             paths.extend(_extract_xlsx_paths(str(value)))
             return
-
-        # Collections
         if isinstance(value, dict):
             for v in value.values():
                 _walk(v)
@@ -124,24 +114,6 @@ def _extract_xlsx_paths_from_obj(obj) -> list[str]:
             for v in value:
                 _walk(v)
             return
-
-        # Attributes commonly used in tool results
-        for attr in (
-            "output_path",
-            "path",
-            "file_path",
-            "filepath",
-            "result",
-            "text",
-            "content",
-        ):
-            if hasattr(value, attr):
-                try:
-                    _walk(getattr(value, attr))
-                except Exception:
-                    pass
-
-        # Fallback to string representation
         try:
             paths.extend(_extract_xlsx_paths(str(value)))
         except Exception:
@@ -160,79 +132,235 @@ def _remember_xlsx_path(path: str) -> None:
             st.session_state.xlsx_files.append(normalized)
 
 
-async def _ensure_session():
+def _summarize_result(tool_name: str, result: Any) -> str:
+    """Build a short human-readable summary of a tool result."""
+    if not isinstance(result, dict):
+        return str(result)[:300]
+    lines: list[str] = []
+    if tool_name in ("write_xlsform", "save_xlsform_draft"):
+        if "output_path" in result:
+            lines.append(f"Saved to: `{result['output_path']}`")
+        if "row_counts" in result:
+            lines.append(f"Row counts: {result['row_counts']}")
+        if "sheet_names" in result:
+            lines.append(f"Sheets: {result['sheet_names']}")
+    elif tool_name == "load_xlsform":
+        if "path" in result:
+            lines.append(f"Loaded: `{result['path']}`")
+        if "sheet_names" in result:
+            lines.append(f"Sheets: {result['sheet_names']}")
+        if "row_counts" in result:
+            lines.append(f"Row counts: {result['row_counts']}")
+    elif tool_name == "new_form_spec":
+        sheets = result.get("sheets", {})
+        lines.append(f"Created blank spec — sheets: {list(sheets.keys())}")
+        for sn, sv in sheets.items():
+            rows = sv.get("rows", [])
+            lines.append(f"  {sn}: {len(rows)} starter rows")
+    elif tool_name == "design_survey_outline":
+        lines.append(f"Topic: {result.get('topic', '?')}")
+        lines.append(f"Survey rows generated: {len(result.get('survey_rows', []))}")
+        lines.append(f"Choice rows generated: {len(result.get('choices_rows', []))}")
+        if result.get("languages"):
+            lines.append(f"Languages: {result['languages']}")
+    elif tool_name == "merge_form_spec":
+        summary = result.get("summary", {})
+        added = summary.get("added", {})
+        skipped = summary.get("skipped", {})
+        for sheet, names in added.items():
+            lines.append(f"Added {len(names)} rows to '{sheet}'")
+        for sheet, names in skipped.items():
+            if names:
+                lines.append(f"Skipped {len(names)} duplicates in '{sheet}'")
+    elif tool_name == "compare_forms":
+        lines.append(f"Missing sheets: {result.get('missing_sheets', [])}")
+        lines.append(f"Extra sheets: {result.get('extra_sheets', [])}")
+        col_gaps = result.get("column_gaps", {})
+        for sheet, gaps in col_gaps.items():
+            missing = gaps.get("missing_in_candidate", [])
+            if missing:
+                lines.append(f"  {sheet} missing cols: {missing}")
+    elif tool_name == "add_calculations_and_conditions":
+        lines.append(f"Added calculations: {result.get('added_calculations', [])}")
+        lines.append(f"Updated targets: {result.get('updated_targets', [])}")
+    elif tool_name == "load_description_document":
+        lines.append(f"Loaded: `{result.get('path', '?')}`")
+        length = result.get("length", 0)
+        truncated = result.get("truncated", False)
+        lines.append(f"Length: {length} chars" + (" (truncated)" if truncated else ""))
+    else:
+        # Generic: show top-level scalar/count fields
+        for k, v in list(result.items())[:8]:
+            if isinstance(v, list):
+                lines.append(f"{k}: [{len(v)} items]")
+            elif isinstance(v, dict):
+                lines.append(f"{k}: {{{len(v)} keys}}")
+            else:
+                lines.append(f"{k}: {str(v)[:120]}")
+    return "\n".join(lines) if lines else "(no summary available)"
+
+
+def _args_summary(tool_name: str, args: dict) -> str:
+    """Concise one-line summary of tool call arguments."""
+    if not args:
+        return "(no args)"
+    # Show scalar args; abbreviate large structures
+    parts: list[str] = []
+    for k, v in args.items():
+        if isinstance(v, (str, int, float, bool)):
+            parts.append(f"{k}={repr(v)}")
+        elif isinstance(v, list):
+            parts.append(f"{k}=[{len(v)} items]")
+        elif isinstance(v, dict):
+            parts.append(f"{k}={{...}}")
+        else:
+            parts.append(f"{k}=...")
+    return ", ".join(parts)
+
+
+def _render_tool_steps(tool_steps: list[dict]) -> None:
+    """Render tool call details inside an expander."""
+    if not tool_steps:
+        return
+    label = f"🔧 {len(tool_steps)} tool call{'s' if len(tool_steps) != 1 else ''} processed"
+    with st.expander(label, expanded=False):
+        for i, step in enumerate(tool_steps):
+            if i > 0:
+                st.divider()
+            name = step["name"]
+            args = step.get("args") or {}
+            result = step.get("result")
+
+            st.markdown(f"**`{name}`** — {_args_summary(name, args)}")
+
+            col_args, col_result = st.columns(2)
+            with col_args:
+                if args:
+                    st.caption("Arguments")
+                    # Show scalar args as text, large structures as JSON
+                    simple = {k: v for k, v in args.items()
+                              if isinstance(v, (str, int, float, bool, type(None)))}
+                    complex_ = {k: v for k, v in args.items() if k not in simple}
+                    if simple:
+                        for k, v in simple.items():
+                            st.text(f"{k}: {v}")
+                    if complex_:
+                        st.json(complex_, expanded=False)
+
+            with col_result:
+                if result is not None:
+                    st.caption("Result summary")
+                    st.text(_summarize_result(name, result))
+
+
+def _render_assistant_message(msg: dict) -> None:
+    """Render one assistant message (text + optional tool steps)."""
+    content = msg.get("content", "")
+    if content:
+        st.markdown(content)
+    _render_tool_steps(msg.get("tool_steps") or [])
+
+
+# ---------------------------------------------------------------------------
+# Display chat history
+# ---------------------------------------------------------------------------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            _render_assistant_message(msg)
+        else:
+            st.markdown(msg["content"])
+
+# ---------------------------------------------------------------------------
+# Agent runner
+# ---------------------------------------------------------------------------
+async def _ensure_session() -> None:
     """Create the ADK session if it doesn't exist yet."""
-    session_id = st.session_state.session_id
-    user_id = st.session_state.user_id
     existing = await session_service.get_session(
         app_name="odk_xlsform_agent",
-        user_id=user_id,
-        session_id=session_id,
+        user_id=st.session_state.user_id,
+        session_id=st.session_state.session_id,
     )
     if existing is None:
         await session_service.create_session(
             app_name="odk_xlsform_agent",
-            user_id=user_id,
-            session_id=session_id,
+            user_id=st.session_state.user_id,
+            session_id=st.session_state.session_id,
         )
 
 
-async def _run_agent(user_input: str) -> str:
-    """Send a message to the ADK agent and return the final response text."""
+async def _run_agent(user_input: str) -> tuple[str, list[dict]]:
+    """
+    Run the agent and return (response_text, tool_steps).
+
+    tool_steps is a list of dicts:
+        {"name": str, "args": dict, "result": dict | None}
+    """
     await _ensure_session()
     content = types.Content(
         role="user",
         parts=[types.Part(text=user_input)],
     )
+
     response_text = ""
-    tool_messages: list[str] = []
+    tool_steps: list[dict] = []
+
     async for event in runner.run_async(
         user_id=st.session_state.user_id,
         session_id=st.session_state.session_id,
         new_message=content,
     ):
-        # Collect final response
-        if event.is_final_response() and event.content and event.content.parts:
-            for part in event.content.parts:
-                if part.text:
-                    response_text += part.text
+        if not event.content or not event.content.parts:
+            continue
 
-        # Detect xlsx files from tool responses
-        if hasattr(event, "actions") and event.actions:
-            tool_results = event.actions.tool_results if hasattr(event.actions, "tool_results") else []
-            for result in tool_results:
+        for part in event.content.parts:
+            # --- tool call ---
+            fc = getattr(part, "function_call", None)
+            if fc is not None:
+                tool_steps.append({
+                    "name": fc.name,
+                    "args": dict(fc.args) if fc.args else {},
+                    "result": None,
+                })
+
+            # --- tool response ---
+            fr = getattr(part, "function_response", None)
+            if fr is not None:
+                raw = getattr(fr, "response", None) or {}
+                result = dict(raw) if isinstance(raw, dict) else raw
+                # Scan for generated xlsx files
                 for path in _extract_xlsx_paths_from_obj(result):
                     _remember_xlsx_path(path)
-                # Capture any text/result content so the user sees a meaningful reply
-                msg = None
-                if hasattr(result, "text") and result.text:
-                    msg = str(result.text)
-                elif hasattr(result, "result") and result.result not in (None, ""):
-                    msg = str(result.result)
-                elif hasattr(result, "output") and result.output not in (None, ""):
-                    msg = str(result.output)
-                else:
-                    # Fallback to repr if nothing else is available
-                    try:
-                        msg = str(result)
-                    except Exception:
-                        msg = None
-                if msg and msg.strip():
-                    tool_messages.append(msg.strip())
+                # Match to the most recent unmatched call with the same name
+                for step in reversed(tool_steps):
+                    if step["name"] == fr.name and step["result"] is None:
+                        step["result"] = result
+                        break
 
-    # Also scan the response text for xlsx paths
+            # --- final text response ---
+            if event.is_final_response():
+                text = getattr(part, "text", None)
+                if text:
+                    response_text += text
+
+    # Scan response text for xlsx paths too
     for path in _extract_xlsx_paths(response_text):
         _remember_xlsx_path(path)
 
-    # If the agent produced no text, surface tool output or saved file info to avoid empty replies
-    if not response_text.strip():
-        if tool_messages:
-            response_text = "\n".join(tool_messages)
-        elif st.session_state.xlsx_files:
-            latest = st.session_state.xlsx_files[-1]
-            response_text = f"Saved draft: {Path(latest).name}"
+    # Build a fallback reply when the agent produced no text
+    if not response_text.strip() and tool_steps:
+        lines: list[str] = []
+        for step in tool_steps:
+            summary = _summarize_result(step["name"], step.get("result") or {})
+            lines.append(f"**`{step['name']}`** completed:\n{summary}")
+        response_text = "\n\n".join(lines)
 
-    return response_text
+    if not response_text.strip() and st.session_state.xlsx_files:
+        latest = st.session_state.xlsx_files[-1]
+        response_text = f"Saved draft: `{Path(latest).name}`"
+
+    return response_text, tool_steps
+
 
 # ---------------------------------------------------------------------------
 # Chat input
@@ -243,13 +371,15 @@ if user_input := st.chat_input("Describe the survey you'd like to create…"):
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Get agent response
+    # Run agent and render response
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
-            response = asyncio.run(_run_agent(user_input))
-        st.markdown(response)
+            response_text, tool_steps = asyncio.run(_run_agent(user_input))
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        msg = {"role": "assistant", "content": response_text, "tool_steps": tool_steps}
+        _render_assistant_message(msg)
+
+    st.session_state.messages.append(msg)
 
     # Rerun to refresh sidebar download buttons
     if st.session_state.xlsx_files:
