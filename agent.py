@@ -632,11 +632,13 @@ def merge_form_spec(
     for sheet_name, extra_sheet in extra.items():
         base_sheet = base.setdefault(sheet_name, {"columns": [], "rows": []})
         base_rows = base_sheet.get("rows") or []
-        existing_names = {r.get("name") for r in base_rows if r.get("name")}
+        existing_names = {r.get("name") for r in base_rows if isinstance(r, dict) and r.get("name")}
 
         added: List[str] = []
         skipped: List[str] = []
         for row in extra_sheet.get("rows") or []:
+            if not isinstance(row, dict):
+                continue  # skip strings or other non-dict values the LLM may pass
             name = row.get("name")
             if dedupe_by_name and name and name in existing_names:
                 skipped.append(name)
