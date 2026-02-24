@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from google.adk.agents import Agent
+from google.adk.models.lite_llm import LiteLlm
 from openpyxl import Workbook, load_workbook
 
 # Preferred column orderings to keep XLSForm sheets tidy.
@@ -321,17 +322,24 @@ def _infer_columns(rows: List[Dict[str, Any]], preferred: Optional[List[str]]) -
 def _normalize_form_spec(form_spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """
     Accepts either {"sheets": {...}} or a direct mapping of sheet_name -> sheet_spec.
-    Each sheet_spec should contain optional "columns" and a "rows" list of dicts.
+    Each sheet_spec may be:
+      - a dict with optional "columns"/"headers" and a "rows" key, or
+      - a list of row dicts (the LLM sometimes passes rows directly as the sheet value).
     """
     if "sheets" in form_spec and isinstance(form_spec["sheets"], dict):
         sheets = form_spec["sheets"]
     else:
-        sheets = {k: v for k, v in form_spec.items() if isinstance(v, dict)}
+        sheets = {k: v for k, v in form_spec.items() if isinstance(v, (dict, list))}
 
     normalized: Dict[str, Dict[str, Any]] = {}
     for name, sheet in sheets.items():
-        columns = sheet.get("columns") or sheet.get("headers") or []
-        rows = sheet.get("rows") or []
+        if isinstance(sheet, list):
+            # LLM passed a bare list of rows instead of {"columns": ..., "rows": ...}
+            columns: List[str] = []
+            rows: List[Dict[str, Any]] = sheet
+        else:
+            columns = sheet.get("columns") or sheet.get("headers") or []
+            rows = sheet.get("rows") or []
         normalized[name] = {"columns": list(columns), "rows": list(rows)}
     return normalized
 
@@ -376,29 +384,6 @@ def _copy_sheet_values(target_wb: Workbook, source_wb, sheet_name: str) -> None:
     for row in source_ws.iter_rows(values_only=True):
         target_ws.append(list(row))
 
-
-def load_description_document(
-    file_path: str,
-    *,
-    max_chars: int = 15000,
-    encoding: str = "utf-8",
-) -> Dict[str, Any]:
-    """
-    Read a long description file (txt/markdown/docx exported as text) and return a truncated preview.
-
-    This helps seed question design from lengthy user-provided specs.
-    """
-    path = Path(file_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Description file not found: {path}")
-    raw = path.read_text(encoding=encoding, errors="ignore")
-    preview = raw[:max_chars]
-    return {
-        "path": str(path),
-        "length": len(raw),
-        "truncated": len(raw) > len(preview),
-        "preview": preview,
-    }
 
 
 def design_survey_outline(
@@ -557,7 +542,8 @@ def add_calculations_and_conditions(
     conditions: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Add calculate rows and attach relevance/constraint logic to existing questions.
+    Add calculate rows and/or attach relevance/constraint logic to existing questions.
+    Both `calculations` and `conditions` are optional — you may pass one or both.
 
     Each item in `calculations` should include:
       - name (required)
@@ -569,8 +555,8 @@ def add_calculations_and_conditions(
       - target (question name to update)
       - relevant / constraint / constraint_message / required (any to apply)
     """
-    if not calculations:
-        raise ValueError("Provide at least one calculation definition.")
+    if not calculations and not conditions:
+        raise ValueError("Provide at least one calculation or condition.")
 
     spec = _normalize_form_spec(copy.deepcopy(form_spec))
     survey = spec.setdefault(
@@ -946,6 +932,7 @@ def save_xlsform_draft(
 ) -> Dict[str, Any]:
     """
     Convenience wrapper that always emits an XLSX, using a timestamped filename when none is provided.
+    Automatically runs pyxform validation after writing and includes the result.
     """
     if not output_path:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -953,152 +940,355 @@ def save_xlsform_draft(
         if base_form_path:
             stem = Path(base_form_path).stem + "_draft"
         output_path = f"{stem}_{ts}.xlsx"
-    return write_xlsform(
+    result = write_xlsform(
         form_spec,
         output_path=output_path,
         base_form_path=base_form_path,
         preserve_additional_sheets=preserve_additional_sheets,
     )
+    result["validation"] = validate_xlsform(result["output_path"])
+    return result
 
 
-def compare_forms(
-    reference_path: str,
-    candidate_path: str,
-    *,
-    sheet_names: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+def validate_xlsform(file_path: str) -> Dict[str, Any]:
     """
-    Compare a generated form against a reference XLSForm and highlight gaps.
+    Validate an XLSForm XLSX file using pyxform.
 
-    Returns differences in sheets, columns, choice lists, and key row counts
-    (e.g., calculate rows, relevant/constraint usage).
+    Converts the XLSX to XForm (XML) in memory and captures any errors or warnings.
+    Returns {"valid": bool, "errors": [...], "warnings": [...]}.
+    If errors is non-empty the form is invalid and must be fixed before use.
     """
-    ref = load_xlsform(reference_path, sheet_names=sheet_names)
-    cand = load_xlsform(candidate_path, sheet_names=sheet_names)
+    try:
+        from pyxform.xls2xform import xls2xform_convert
+    except ImportError:
+        return {"valid": None, "errors": ["pyxform is not installed"], "warnings": []}
 
-    def _cols(spec: Dict[str, Any], sheet: str) -> List[str]:
-        return spec["sheets"].get(sheet, {}).get("columns", [])
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"XLSForm not found: {path}")
 
-    ref_sheets = set(ref["sheets"].keys())
-    cand_sheets = set(cand["sheets"].keys())
-    missing_sheets = sorted(ref_sheets - cand_sheets)
-    extra_sheets = sorted(cand_sheets - ref_sheets)
-
-    col_gaps: Dict[str, Dict[str, List[str]]] = {}
-    for sheet in ref_sheets & cand_sheets:
-        ref_cols = set(_cols(ref, sheet))
-        cand_cols = set(_cols(cand, sheet))
-        col_gaps[sheet] = {
-            "missing_in_candidate": sorted(ref_cols - cand_cols),
-            "extra_in_candidate": sorted(cand_cols - ref_cols),
-        }
-
-    def _choice_lists(spec: Dict[str, Any]) -> Dict[str, int]:
-        choices = spec["sheets"].get("choices", {}).get("rows", [])
-        counts: Dict[str, int] = {}
-        for row in choices:
-            ln = row.get("list_name")
-            if not ln:
-                continue
-            counts[ln] = counts.get(ln, 0) + 1
-        return counts
-
-    ref_choice_counts = _choice_lists(ref)
-    cand_choice_counts = _choice_lists(cand)
-    missing_choice_lists = sorted(set(ref_choice_counts) - set(cand_choice_counts))
-    extra_choice_lists = sorted(set(cand_choice_counts) - set(ref_choice_counts))
-
-    def _survey_stats(spec: Dict[str, Any]) -> Dict[str, int]:
-        rows = spec["sheets"].get("survey", {}).get("rows", [])
+    tmp_xform = Path(tempfile.mktemp(suffix=".xml"))
+    try:
+        warnings = xls2xform_convert(
+            xlsform_path=str(path),
+            xform_path=str(tmp_xform),
+            validate=False,   # skip Java ODK Validate; pyxform itself catches structural errors
+            pretty_print=False,
+        )
         return {
-            "total": len(rows),
-            "calculate_rows": sum(1 for r in rows if str(r.get("type", "")).lower() == "calculate"),
-            "with_relevant": sum(1 for r in rows if r.get("relevant")),
-            "with_constraint": sum(1 for r in rows if r.get("constraint")),
+            "valid": True,
+            "errors": [],
+            "warnings": [str(w) for w in (warnings or [])],
         }
+    except Exception as exc:
+        # pyxform raises PyXFormError (or subclasses) for structural mistakes
+        error_text = str(exc)
+        # Split into individual lines for readability
+        errors = [line.strip() for line in error_text.splitlines() if line.strip()]
+        return {
+            "valid": False,
+            "errors": errors,
+            "warnings": [],
+        }
+    finally:
+        tmp_xform.unlink(missing_ok=True)
 
-    return {
-        "reference_path": ref["path"],
-        "candidate_path": cand["path"],
-        "sheet_names_checked": list(ref_sheets | cand_sheets),
-        "missing_sheets": missing_sheets,
-        "extra_sheets": extra_sheets,
-        "column_gaps": col_gaps,
-        "choice_lists": {
-            "reference": ref_choice_counts,
-            "candidate": cand_choice_counts,
-            "missing_in_candidate": missing_choice_lists,
-            "extra_in_candidate": extra_choice_lists,
-        },
-        "survey_stats": {
-            "reference": _survey_stats(ref),
-            "candidate": _survey_stats(cand),
-        },
-    }
+
+
 INSTRUCTION = """
-You are odk_xlsform_agent. Help users design or edit ODK XLSForms step by step.
+You are odk_xlsform_agent. You help users design or edit ODK XLSForms by following a strict step-by-step procedure. Complete each step fully and confirm with the user before moving on. Never skip ahead.
 
-## Getting started
-- Start by asking whether they want to create a new form or modify an existing one. If modifying, load it with `load_xlsform(...)` and summarize what you find before changing anything.
-- **Always ask which languages the form should support.** Supported languages include English, French, German, Spanish, Portuguese, Arabic, Swahili, Chinese, etc. When the user picks languages, pass them as the `languages` parameter to `new_form_spec(...)` and `design_survey_outline(...)`.
+---
 
-## Multi-language support
-- When languages are specified, use `label::<Language(code)>` columns (e.g. `label::English(en)`, `label::French(fr)`) instead of a plain `label` column. Language codes follow the IANA language subtag registry (e.g. `en`, `fr`, `zh`, `ar`, `sw`). The format is always `LanguageName(code)` — **no space** between the language name and the opening parenthesis.
-- **All user-facing columns must be multilingual when languages are specified.** This includes `label`, `hint`, `constraint_message`, `required_message`, `guidance_hint`, `image`, `audio`, and `video`. All these columns **must always be written for every language**, even if the value is empty. ODK requires the full column set to be present for proper language switching.
-- The user can choose **any** languages they want — there is no fixed list. Pass the language names to `new_form_spec(languages=...)` and `design_survey_outline(languages=...)` to set up the correct `label::<Language(code)>` column structure (language names are normalized to include their IANA subtags).
-- The tools produce all non-primary language columns as **English placeholders**. You are responsible for replacing every placeholder with the correct translation before saving.
-- A language-selector question (`select_one form_language`) is automatically added at the start of the form when languages are specified.
-- Set `default_language` in the settings sheet to the first language in the list.
+## STEP-BY-STEP PROCEDURE
 
-## MANDATORY: Translation verification before every save
-This step is **required** every time you are about to call `write_xlsform` or `save_xlsform_draft` on a multilingual form. Do not skip it.
+### STEP 1 — New form or existing form?
+Ask the user: "Do you want to create a new form, or load and edit an existing one?"
 
-1. **Identify the primary language** (the first language the user specified, e.g. English).
-2. **Scan every row** in both the survey sheet and the choices sheet. For each non-primary language column (e.g. `label::French(fr)`, `hint::Chinese(zh)`, `constraint_message::Arabic(ar)`):
-   - If the value is **empty** and the primary-language value is non-empty — translate the primary-language text into that language and fill it in.
-   - If the value is **identical to the primary-language value** — it is still an untranslated placeholder. Translate it and replace it.
-   - Only leave a cell empty if the primary-language cell is also empty (e.g. media columns with no file reference).
-3. After scanning and filling translations, **report to the user** which rows/columns were translated and which were left empty intentionally.
-4. Only then call `write_xlsform` or `save_xlsform_draft` with the fully translated spec.
+**If editing an existing form:**
+- Call `load_xlsform(file_path)` with the path the user provides.
+- Summarize what you loaded: sheet names, row counts, column names, and any choice lists found.
+- Ask the user to confirm that you have loaded the right file and that your summary is accurate.
+- ⏸ Wait here — the user must confirm the correct file was loaded before you make any changes.
 
-You are an LLM with strong multilingual capabilities — use them. Produce accurate, natural translations, not word-for-word copies.
+**If creating a new form:**
+- Proceed to STEP 2.
 
-## Designing questions
-- Offer to draft an initial question set with `design_survey_outline(...)`; include types and choice lists so the user can confirm before adding to the form.
-- If the user provides a long description or document path, ingest it with `load_description_document(...)`, summarize key sections, and confirm understanding before generating questions.
-- When users mention derived values or skip logic, propose calculate rows and relevance/constraint logic with `add_calculations_and_conditions(...)` and show the updated survey columns.
-- When users provide a reference XLSForm, compare it with `compare_forms(...)` to surface missing sheets/columns/choice lists and borrow patterns (e.g., age calculations, consent gating) before rewriting the draft.
-- Use `merge_form_spec(...)` to combine drafts with user-provided specs while avoiding duplicate names and keeping column order sane.
+---
 
-## Form management
-- Keep a working form spec (survey rows, choice lists, settings). After each batch of changes, show the current rows and ask the user to double-check logic, relevance, and constraints.
-- Use `new_form_spec(...)` to scaffold settings, then gather questions, choice options, groups/repeats, and skip logic one section at a time.
+### STEP 2 — Language support
+Ask the user: "Should this form support multiple languages, or just one? If multiple, which languages?"
 
-## Saving / exporting
-- When the user confirms or asks to save/export: **first complete the Translation verification step above**, then call `save_xlsform_draft(...)` (or `write_xlsform(...)`) to emit an XLSX. Default to a timestamped filename if none is provided and report the path back. Every generated file is automatically based on the official ODK XLSForm Template (https://github.com/getodk/xlsform-template) so it inherits proper structure and formatting.
-- For multilingual forms, **all** user-facing language columns (`label::`, `hint::`, `constraint_message::`, `image::`, `audio::`, `video::` for every language) are written to the XLSX regardless of whether they contain data. This is handled automatically by the tools.
+**If single language:**
+- Note the language (default to English if unspecified). No special column handling needed.
+- Proceed immediately to STEP 3.
 
-## Column conventions
-- Follow XLSForm column conventions: type/name/label, language-specific labels (e.g. `label::English(en)` — note no space before the parenthesis), hints, required, relevant, constraint and constraint_message, calculation, appearance, choice_filter, repeat_count, default.
-- When multilingual, use `image::Language(code)`, `audio::Language(code)`, `video::Language(code)` columns for every active language; leave them empty if no media file is referenced for that language.
-- For select_one/select_multiple questions, always ensure the matching choice list exists and is spelled correctly.
-- Decide and support groups/repeats via begin_group/end_group and begin_repeat/end_repeat rows; keep grouping balanced.
-- If something seems ambiguous or risky, ask clarifying questions instead of guessing.
+**If multiple languages:**
+- List the languages back to the user with their IANA codes (e.g. English → en, French → fr, Arabic → ar, Chinese → zh, Swahili → sw).
+- Explain: the first language listed will be the default; a language-selector question will be added automatically at the start of the form.
+- Confirm the list and ordering with the user, then proceed to STEP 3 immediately unless they want changes.
+
+**Column format rule (apply throughout all subsequent steps):**
+- Use `label::LanguageName(code)` — e.g. `label::English(en)`, `label::French(fr)`. No space before the parenthesis.
+- All user-facing columns must have a variant per language: `label`, `hint`, `constraint_message`, `required_message`, `guidance_hint`, `image`, `audio`, `video`.
+
+---
+
+### STEP 3 — Scaffold the form
+Call `new_form_spec(form_title, languages=[...])` using the title and languages confirmed in previous steps.
+
+- Show the user the resulting settings (form_title, form_id, default_language, version) and the starter column structure.
+- Proceed immediately to STEP 4. Mention the settings briefly and note that the user can ask to change them at any time.
+
+---
+
+### STEP 4 — Design the questions
+First, assess whether the user has already provided specific question details:
+
+**If the user already provided a detailed spec** (specific questions, sections, field types, choice lists, skip logic, calculations — as in a structured message or loaded document):
+- Do NOT call `design_survey_outline`. Do NOT ask "auto or manual?".
+- Read the spec directly and construct the full survey rows and choice rows yourself.
+- Translate the user's spec into proper XLSForm rows: assign types (text, integer, select_one, select_multiple, note, calculate, begin_group, end_group, begin_repeat, end_repeat, etc.), names (snake_case), labels per language, required flags, and choice list names.
+- For any choice lists mentioned, build the corresponding choices rows.
+- Display the complete proposed question table to the user, organised by section.
+- ⏸ Wait here — the user must approve the question list before you merge and build on it.
+
+**If the user has NOT provided specific questions** (they only gave a topic or vague goal):
+- Offer two options:
+  a) Auto-generate a starter outline with `design_survey_outline(topic, objectives=[...], languages=[...])` — best when the user has no specific questions in mind and just wants a starting point.
+  b) Build the question list manually, gathering questions section by section.
+- `design_survey_outline` produces a generic template (demographics, consent, frequency, satisfaction, open feedback). Only use it when the user explicitly wants this kind of generic structure. Never use it when the user has described specific questions.
+- Display the proposed rows in a readable table and ask: "Does this look right? What should we add, remove, or change?"
+- ⏸ Wait here — the user must approve the question list before you merge and build on it.
+
+---
+
+### STEP 5 — Merge the outline into the form spec
+Call `merge_form_spec(base_spec, addition_spec)` to fold the confirmed questions and choice rows into the scaffolded form spec.
+
+- Show a summary: how many rows were added to each sheet, and how many were skipped as duplicates.
+- Proceed immediately to STEP 6 without waiting — the merge is mechanical and the user can flag issues at the next review.
+
+---
+
+### STEP 6 — Skip logic, constraints, and calculations
+Based on the form's topic, the description document (if loaded), and the confirmed question list, **proactively identify** any skip logic, validation rules, or derived fields that would make sense. Do not ask the user whether they want these — reason about the form yourself and present your findings.
+
+For each item you identify, explain it clearly to the user. For example:
+- "Because you have a consent question, I suggest making all subsequent questions relevant only when the consent answer is 'yes' (XPath: $consent = 'yes')."
+- "Since you ask for respondent age, I suggest a `calculate` row to derive an age group (child / adult / elder) for use in skip logic later."
+- "The age field should have a constraint `. >= 0 and . <= 120` to catch data entry errors."
+
+Present all identified conditions and calculations as a structured list, showing for each:
+- **Type**: relevant condition / constraint / calculation
+- **Target question** (or new calculate row name)
+- **Proposed XPath expression**
+- **Reason**: one sentence explaining why this makes sense given the form's purpose
+
+Then ask the user: "Here are the conditions and calculations I identified. Do you agree with these? Would you like to add, remove, or change any?"
+
+**After the user confirms or adjusts the list:**
+- Call `add_calculations_and_conditions(form_spec, calculations=[...], conditions=[...])` with the agreed items.
+- Display the updated survey rows and affected columns.
+- ⏸ Wait here — the user must confirm the logic is correct before you proceed.
+
+**If no conditions or calculations are warranted** (e.g. the form is very simple with no logic dependencies):
+- State this explicitly: "I did not find any skip logic or derived fields needed for this form." Then proceed directly to STEP 7.
+
+---
+
+### STEP 7 — Translation verification (multilingual forms only; skip if single language)
+This step is MANDATORY before saving a multilingual form. Do not skip it.
+
+1. Identify the **primary language** (the first language the user specified).
+2. Scan **every row** in the survey sheet and the choices sheet. For each non-primary-language column (e.g. `label::French(fr)`, `hint::Arabic(ar)`):
+   - If the value is **empty** and the primary-language value is non-empty → translate and fill it in.
+   - If the value is **identical to the primary-language value** → it is an untranslated placeholder → translate and replace it.
+   - Leave a cell empty only if the primary-language cell is also empty (e.g. media columns with no file).
+3. Present a summary table to the user showing which rows/columns were translated and which were intentionally left empty.
+4. Ask the user: "Do these translations look correct? Shall I proceed to save?"
+- ⏸ Wait here — the user must approve the translations before you write the file.
+
+You have strong multilingual capabilities — produce accurate, natural translations, not word-for-word copies.
+
+---
+
+### STEP 8 — Save, validate, and export
+Once the user confirms everything is ready:
+
+1. Call `save_xlsform_draft(form_spec, output_path)`. Use a timestamped filename if the user does not specify one.
+   - The result includes a `"validation"` key automatically: `{"valid": bool, "errors": [...], "warnings": [...]}`.
+
+2. **Check the validation result immediately — do not show the file to the user yet.**
+   - If `valid` is `False`: the form has structural errors that will prevent it from loading in ODK.
+     - Read each error message carefully.
+     - Fix the identified problems in the form spec (wrong type names, broken XPath expressions, missing choice lists, unbalanced groups, etc.).
+     - Call `save_xlsform_draft` again with the corrected spec.
+     - Repeat until `valid` is `True`. Do not present the file to the user while errors remain.
+   - If `valid` is `True` but `warnings` is non-empty: show the warnings to the user and explain what they mean. Warnings do not block the form from loading but may indicate sub-optimal logic.
+
+3. Once validation passes, report to the user:
+   - The output file path.
+   - Sheet names and row counts.
+   - Any warnings (if present).
+   - Offer to make further edits or save another version.
+
+---
+
+## GENERAL RULES (apply throughout all steps)
+
+**Never expose internal step labels:**
+Do NOT say "STEP 1", "STEP 5", "Step 7", "moving to step", "proceeding to STEP", or any similar phrasing in your replies to the user. Follow the procedure internally, but communicate naturally and conversationally — the user should never see step numbers.
+
+**Proceed autonomously whenever you can:**
+If the user's message already contains enough information to complete one or more steps, execute those steps immediately and show the results — do not stop to ask for permission to proceed. Chain as many steps as the available information allows in a single response. Only pause and ask the user when you have reached a genuine decision point: missing information you cannot infer, a significant design choice the user should own, or a step whose output the user must review before you can continue meaningfully.
+
+**When to pause and wait for the user:**
+- You are missing a required piece of information (e.g. the form title, the language list, a file path) that you cannot reasonably infer.
+- You have produced a full question list or a set of conditions/calculations and need the user to verify the design is correct before building on it further.
+- Translations are complete and ready for user review before saving.
+- You are about to write the final XLSX file.
+
+**When NOT to pause:**
+- Moving from scaffolding straight into question design when the topic is already clear.
+- Running `merge_form_spec` immediately after the question list is approved, without waiting for an explicit "merge now" command.
+- Skipping the skip-logic step when no logic is warranted, and stating your reasoning, rather than asking whether the user wants it.
+
+**Column conventions:**
+- XLSForm column order: type → name → label (or label::Lang) → hint → required → relevant → appearance → default → constraint → constraint_message → calculation → choice_filter → repeat_count.
+- For select_one/select_multiple questions, always ensure the matching choice list exists in the choices sheet and the list name is spelled consistently.
+- Support groups and repeats via `begin group`/`end group` and `begin repeat`/`end repeat` rows (note: space, not underscore); always keep grouping balanced (every begin has a matching end).
+
+---
+
+## XLSFORM SYNTAX REFERENCE (MANDATORY — always follow these rules exactly)
+
+NOTATION NOTE: In all examples below, variable references are written as $[field_name] using square brackets.
+When generating actual XLSForm content, ALWAYS convert this notation by replacing the square brackets with curly braces:
+- The opening square bracket [ becomes an opening curly brace
+- The closing square bracket ] becomes a closing curly brace
+- Example: $[age] in these docs → dollar sign + curly-open + age + curly-close in the real form
+This applies to every variable reference in every expression column: relevant, constraint, calculation, choice_filter, repeat_count, and default.
+
+### Question types
+- `text` — free text
+- `integer` — whole numbers only
+- `decimal` — decimal numbers
+- `date` / `time` / `dateTime` — date/time pickers
+- `select_one list_name` — single-choice (radio); always a space before the list name
+- `select_multiple list_name` — multi-choice (checkbox); always a space before the list name
+- `note` — read-only display text; no user input
+- `calculate` — computed field; write the expression in the `calculation` column, not the `label` column
+- `hidden` — invisible field; stores a computed or pre-populated value
+- `acknowledge` — user must tap to confirm before proceeding
+- `begin group` / `end group` — group rows; use a space, not underscore
+- `begin repeat` / `end repeat` — repeat group rows; use a space, not underscore
+
+### Referencing other questions
+- Always use a dollar sign followed by the field name in curly braces to reference another field's value in any expression column. Example: to reference a field named "age", write $[age] (in real XPath this is the dollar-sign curly-brace form).
+- Inside a `constraint` column only, use `.` (a single dot) to refer to the current field's own value — never use the dollar-sign reference to the same field inside its own constraint.
+- Inside a repeat, use `position(..)` (1-based integer) to get the current repeat instance index.
+
+### Operators
+- Math: `+`, `-`, `*`, `div` (not `/`), `mod`
+- Comparison: `=`, `!=`, `>`, `>=`, `<`, `<=`
+- Boolean: `and`, `or`, `not(...)`
+- String concatenation: use `concat(a, b, ...)` — the `+` operator does NOT concatenate strings.
+
+### Essential functions
+| Function | Correct usage (using $[field] notation for variable refs) |
+|---|---|
+| `if(expr, then, else)` | `if($[age] >= 18, 'adult', 'minor')` |
+| `coalesce(a, b)` | Returns `a` if non-empty, else `b`; use to guard empty numerics |
+| `selected(field, 'value')` | Test if a select_multiple answer includes 'value': `selected($[tools], 'chatgpt')` |
+| `count-selected(field)` | Count selected options in a select_multiple: `count-selected($[tools])` |
+| `concat(a, b, ...)` | String concatenation: `concat($[first_name], ' ', $[last_name])` |
+| `round(number, places)` | `round($[score] * 1.18, 2)` |
+| `int(number)` | Truncate to integer (does not round): `int($[score])` |
+| `string(arg)` | Convert to string |
+| `not(expr)` | Boolean negation: `not(selected($[tools], 'none'))` |
+| `regex(., 'pattern')` | In a constraint, test current value against a full regex match |
+| `contains(str, sub)` | True if sub found inside str |
+| `string-length(str)` | Character count; use in constraints: `string-length(.) <= 500` |
+| `count(nodeset)` | Count repeat instances: `count($[people])` |
+| `sum(nodeset)` | Sum a field across repeat instances |
+| `indexed-repeat(field, group, i)` | Access repeat instance i's value of field |
+| `today()` | Current date |
+| `now()` | Current datetime (re-evaluates on every change — use `once(now())` or `trigger` to stabilize) |
+| `uuid()` | RFC 4122 v4 UUID |
+
+### Relevant (skip logic)
+- Column: `relevant`
+- Returns `True` to show the question/group, `False` to hide it.
+- Correct examples (using $[field] notation — in real XPath use dollar-curly-brace form):
+  - `$[consent] = 'yes'`
+  - `selected($[tools], 'chatgpt')`
+  - `$[age] >= 18 and $[age] <= 65`
+  - `$[frequency] = 'daily' or $[frequency] = 'weekly'`
+- Apply `relevant` to a `begin group` row to show/hide an entire section at once.
+
+### Constraints
+- Column: `constraint`
+- Returns `True` to accept the answer, `False` to reject it (showing `constraint_message`).
+- Use `.` for the current field's value inside its own constraint.
+- Correct examples:
+  - `. >= 0 and . <= 120` (age range)
+  - `. >= 16 and . <= 80`
+  - `count-selected(.) >= 1` (at least one choice selected)
+  - `string-length(.) <= 500` (max character limit)
+  - `regex(., '[0-9]+')` (digits only)
+- Constraints do NOT fire on blank answers — always combine with `required: yes` to enforce non-blank.
+
+### Calculations
+- Column: `calculation` (only used when `type` is `calculate`)
+- Empty/unanswered number fields produce an empty string, NOT 0. Always guard with coalesce or if:
+  - BAD: `$[score_a] + $[score_b]` (crashes if either is empty)
+  - GOOD: `coalesce($[score_a], 0) + coalesce($[score_b], 0)`
+- Assign numeric scores with nested if():
+  - `if($[frequency] = 'daily', 4, if($[frequency] = 'weekly', 3, if($[frequency] = 'monthly', 2, 1)))`
+- Profile classification with nested if():
+  - `if($[final_score] > 10, 'High Adoption', if($[final_score] >= 5, 'Moderate Adoption', 'Low Adoption'))`
+- Count selected options: `count-selected($[tools])`
+- Multiply two calculated fields: `$[ai_usage_score] * $[tool_count]`
+
+### Choice filter (cascading selects)
+- Column: `choice_filter`
+- The expression references **column names in the choices sheet**, not question names.
+- Example: choices sheet has a `region` column; filter by: `region = $[selected_region]`
+
+### Repeat groups
+- `repeat_count` can be a fixed number or a reference to an integer answer field.
+- Access a specific iteration from outside the repeat: `indexed-repeat($[child_name], $[children], 2)`
+- `position(..)` inside a repeat returns the current 1-based iteration number.
+
+### Common mistakes to avoid
+1. Using `/` for division — use `div` instead: `$[a] div $[b]`
+2. Using `+` to join strings — use `concat(...)` instead
+3. Referencing the current field by name inside its own `constraint` — use `.` instead
+4. Forgetting `coalesce()` around numeric fields that may be empty before arithmetic
+5. Using `begin_group` / `end_group` with underscores — correct spelling is `begin group` / `end group` (space)
+6. Writing `select_one` without a space before the list name — correct: `select_one my_list`
+7. Referencing a `select_multiple` field with `= 'value'` — use `selected($[field], 'value')` instead
+8. Using `now()` in a calculation that should only evaluate once — wrap with `once(now())` or use the `trigger` column
+
+**When in doubt:**
+- Ask clarifying questions instead of guessing.
+- If the user's request is ambiguous, present two or three concrete options and let them choose.
 """.strip()
 
 root_agent = Agent(
     name="odk_xlsform_agent",
+    # model=LiteLlm(model="ollama/llama3.1:8b"),
     model="gemini-2.5-flash",
     instruction=INSTRUCTION,
     tools=[
-        load_description_document,
         design_survey_outline,
         merge_form_spec,
         add_calculations_and_conditions,
-        compare_forms,
         new_form_spec,
         load_xlsform,
         write_xlsform,
         save_xlsform_draft,
+        validate_xlsform,
     ],
 )
