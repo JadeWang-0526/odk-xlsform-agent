@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
+# from google.adk.models.lite_llm import LiteLlm
 from openpyxl import Workbook, load_workbook
 
 # Preferred column orderings to keep XLSForm sheets tidy.
