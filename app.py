@@ -56,6 +56,8 @@ if "session_counter" not in st.session_state:
     st.session_state.session_counter = 0
 if "xlsx_files" not in st.session_state:
     st.session_state.xlsx_files = []
+if "button_clicked" not in st.session_state:
+    st.session_state.button_clicked = None
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -144,6 +146,26 @@ def _summarize_result(tool_name: str, result: Any) -> str:
             lines.append(f"Row counts: {result['row_counts']}")
         if "sheet_names" in result:
             lines.append(f"Sheets: {result['sheet_names']}")
+        v = result.get("validation") or {}
+        if v.get("valid") is True:
+            w = v.get("warnings") or []
+            lines.append(f"✅ Validation passed" + (f" ({len(w)} warning{'s' if len(w) != 1 else ''})" if w else ""))
+        elif v.get("valid") is False:
+            errs = v.get("errors") or []
+            lines.append(f"❌ Validation FAILED — {len(errs)} error{'s' if len(errs) != 1 else ''}")
+            for e in errs[:3]:
+                lines.append(f"  • {e[:120]}")
+    elif tool_name == "validate_xlsform":
+        if result.get("valid") is True:
+            w = result.get("warnings") or []
+            lines.append(f"✅ Valid" + (f" — {len(w)} warning{'s' if len(w) != 1 else ''}" if w else ""))
+            for w_msg in w[:3]:
+                lines.append(f"  ⚠ {w_msg[:120]}")
+        elif result.get("valid") is False:
+            errs = result.get("errors") or []
+            lines.append(f"❌ Invalid — {len(errs)} error{'s' if len(errs) != 1 else ''}")
+            for e in errs[:5]:
+                lines.append(f"  • {e[:120]}")
     elif tool_name == "load_xlsform":
         if "path" in result:
             lines.append(f"Loaded: `{result['path']}`")
@@ -172,22 +194,9 @@ def _summarize_result(tool_name: str, result: Any) -> str:
         for sheet, names in skipped.items():
             if names:
                 lines.append(f"Skipped {len(names)} duplicates in '{sheet}'")
-    elif tool_name == "compare_forms":
-        lines.append(f"Missing sheets: {result.get('missing_sheets', [])}")
-        lines.append(f"Extra sheets: {result.get('extra_sheets', [])}")
-        col_gaps = result.get("column_gaps", {})
-        for sheet, gaps in col_gaps.items():
-            missing = gaps.get("missing_in_candidate", [])
-            if missing:
-                lines.append(f"  {sheet} missing cols: {missing}")
     elif tool_name == "add_calculations_and_conditions":
         lines.append(f"Added calculations: {result.get('added_calculations', [])}")
         lines.append(f"Updated targets: {result.get('updated_targets', [])}")
-    elif tool_name == "load_description_document":
-        lines.append(f"Loaded: `{result.get('path', '?')}`")
-        length = result.get("length", 0)
-        truncated = result.get("truncated", False)
-        lines.append(f"Length: {length} chars" + (" (truncated)" if truncated else ""))
     else:
         # Generic: show top-level scalar/count fields
         for k, v in list(result.items())[:8]:
@@ -253,6 +262,86 @@ def _render_tool_steps(tool_steps: list[dict]) -> None:
                     st.text(_summarize_result(name, result))
 
 
+# (pattern, yes_label, no_label)
+# Patterns are checked in order — put more specific ones first.
+_BINARY_QUESTION_PATTERNS: list[tuple[str, str, str]] = [
+
+    # --- Translations ---
+    (r"\bdo these translations look correct\b",
+     "Yes, translations are correct — proceed to save",
+     "No, I want to make further changes"),
+    (r"\bdo the translations look (correct|right|good)\b",
+     "Yes, proceed to save",
+     "No, make changes first"),
+
+    # --- Saving ---
+    (r"\bshall i proceed to save\b",   "Yes, save the form now",  "No, make changes first"),
+    (r"\bproceed to save\b",           "Yes, save the form now",  "No, make changes first"),
+    (r"\bshall i save\b",              "Yes, save it",            "No, not yet"),
+    (r"\bdo you want me to save\b",    "Yes, save it",            "No, not yet"),
+    (r"\bwould you like (me )?to save\b", "Yes, save it",         "No, not yet"),
+
+    # --- Conditions and calculations ---
+    (r"\bdo you agree with these (conditions|calculations|suggestions|items)\b",
+     "Yes, I agree with all of them",
+     "No, I want to adjust some"),
+    (r"\bwould you like to (add|remove|change) any\b",
+     "Yes, everything looks good",
+     "No, I want to adjust some"),
+    (r"\badd, remove, or change any\b",
+     "Yes, everything looks good",
+     "No, I want to make adjustments"),
+
+    # --- General approval of lists / outlines / tables ---
+    (r"\bdoes this (outline|question list|list of questions|structure|table|form spec|summary) look (right|correct|good|ok)\b",
+     "Yes, looks good",
+     "No, make changes"),
+    (r"\bdo(es)? (this|the|these) (questions?|rows?|sections?|fields?|choices?) look (right|correct|good|ok)\b",
+     "Yes, looks good",
+     "No, make changes"),
+    (r"\bwhat should we (add|remove|change)\b",
+     "Looks good, nothing to change",
+     "I have some changes"),
+    (r"\bdoes (everything|this) look (right|correct|good|ok)\b",
+     "Yes, looks good",
+     "No, make changes"),
+
+    # --- Language list confirmation (STEP 3) ---
+    (r"\b(is the|does the) language (list|selection|order) (look )?(correct|right|ok)\b",
+     "Yes, the language list is correct",
+     "No, I want to change it"),
+
+    # --- Auto-generate vs manual (STEP 5) ---
+    (r"\bauto.?generat\b",
+     "Auto-generate a starter outline",
+     "I'll describe the questions manually"),
+
+    # --- Generic proceed / continue ---
+    (r"\bshall i proceed\b",           "Yes, proceed",   "No, wait"),
+    (r"\bshall i (go ahead|continue|move on)\b", "Yes, continue", "No, pause here"),
+    (r"\bshall i (add|apply|include|attach|merge)\b", "Yes, go ahead", "No, not yet"),
+    (r"\bwould you like (me )?to (add|apply|include|attach|merge|continue|proceed)\b",
+     "Yes, please",
+     "No, not yet"),
+
+    # --- Generic agreement / correctness ---
+    (r"\bdo you agree\b",              "Yes, I agree",   "No, let me adjust"),
+    (r"\bis this (correct|right|good|ok)\b", "Yes, correct", "No, make changes"),
+    (r"\bare (these|the) (settings|details|fields|values) (correct|right|ok)\b",
+     "Yes, all correct",
+     "No, I want to change some"),
+]
+
+
+def _detect_binary_question(text: str) -> dict | None:
+    """Return {"yes": label, "no": label} if the text contains a binary decision question."""
+    lower = text.lower()
+    for pattern, yes_label, no_label in _BINARY_QUESTION_PATTERNS:
+        if re.search(pattern, lower):
+            return {"yes": yes_label, "no": no_label}
+    return None
+
+
 def _render_assistant_message(msg: dict) -> None:
     """Render one assistant message (text + optional tool steps)."""
     content = msg.get("content", "")
@@ -264,10 +353,25 @@ def _render_assistant_message(msg: dict) -> None:
 # ---------------------------------------------------------------------------
 # Display chat history
 # ---------------------------------------------------------------------------
-for msg in st.session_state.messages:
+for i, msg in enumerate(st.session_state.messages):
+    is_last = i == len(st.session_state.messages) - 1
     with st.chat_message(msg["role"]):
         if msg["role"] == "assistant":
             _render_assistant_message(msg)
+            # Show yes/no buttons only for the last assistant message,
+            # and only when no button click is already being processed.
+            if is_last and not st.session_state.button_clicked:
+                buttons = _detect_binary_question(msg.get("content", ""))
+                if buttons:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button(buttons["yes"], key="btn_yes", type="primary", use_container_width=True):
+                            st.session_state.button_clicked = buttons["yes"]
+                            st.rerun()
+                    with col2:
+                        if st.button(buttons["no"], key="btn_no", use_container_width=True):
+                            st.session_state.button_clicked = buttons["no"]
+                            st.rerun()
         else:
             st.markdown(msg["content"])
 
@@ -337,17 +441,18 @@ async def _run_agent(user_input: str) -> tuple[str, list[dict]]:
                         step["result"] = result
                         break
 
-            # --- final text response ---
-            if event.is_final_response():
-                text = getattr(part, "text", None)
-                if text:
-                    response_text += text
+            # --- text response (collect from ALL events, not just final) ---
+            # This ensures we never miss model text that arrives in non-final
+            # streaming events before the "done" signal.
+            text = getattr(part, "text", None)
+            if text:
+                response_text += text
 
     # Scan response text for xlsx paths too
     for path in _extract_xlsx_paths(response_text):
         _remember_xlsx_path(path)
 
-    # Build a fallback reply when the agent produced no text
+    # Fallback 1: synthesise a summary from tool results when model emitted no text
     if not response_text.strip() and tool_steps:
         lines: list[str] = []
         for step in tool_steps:
@@ -355,17 +460,57 @@ async def _run_agent(user_input: str) -> tuple[str, list[dict]]:
             lines.append(f"**`{step['name']}`** completed:\n{summary}")
         response_text = "\n\n".join(lines)
 
+    # Fallback 2: mention the most-recently saved file
     if not response_text.strip() and st.session_state.xlsx_files:
         latest = st.session_state.xlsx_files[-1]
         response_text = f"Saved draft: `{Path(latest).name}`"
+
+    # Fallback 3: absolute last resort — nudge the model once, then use a
+    # placeholder.  This prevents an empty assistant message from being stored
+    # in session state, which would cause Gemini to return empty on every
+    # subsequent turn (the "stuck" loop).
+    if not response_text.strip():
+        nudge = types.Content(
+            role="user",
+            parts=[types.Part(text="Please continue and respond to my previous message.")],
+        )
+        try:
+            async for event in runner.run_async(
+                user_id=st.session_state.user_id,
+                session_id=st.session_state.session_id,
+                new_message=nudge,
+            ):
+                if not event.content or not event.content.parts:
+                    continue
+                for part in event.content.parts:
+                    text = getattr(part, "text", None)
+                    if text:
+                        response_text += text
+        except Exception:
+            pass
+
+    # Absolute placeholder if everything above failed
+    if not response_text.strip():
+        response_text = "_(Understood. What would you like to do next?)_"
 
     return response_text, tool_steps
 
 
 # ---------------------------------------------------------------------------
-# Chat input
+# Chat input  (button clicks take priority over typed input)
 # ---------------------------------------------------------------------------
-if user_input := st.chat_input("Describe the survey you'd like to create…"):
+user_input: str | None = None
+
+# Consume a pending button click
+if st.session_state.button_clicked:
+    user_input = st.session_state.button_clicked
+    st.session_state.button_clicked = None
+
+# Fall back to the text input box
+if not user_input:
+    user_input = st.chat_input("Describe the survey you'd like to create…")
+
+if user_input:
     # Show user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -379,8 +524,10 @@ if user_input := st.chat_input("Describe the survey you'd like to create…"):
         msg = {"role": "assistant", "content": response_text, "tool_steps": tool_steps}
         _render_assistant_message(msg)
 
-    st.session_state.messages.append(msg)
+    # Only store the message when it has visible content — an empty assistant
+    # message in session state causes Gemini to return empty on the next turn.
+    if response_text.strip() or tool_steps:
+        st.session_state.messages.append(msg)
 
-    # Rerun to refresh sidebar download buttons
-    if st.session_state.xlsx_files:
-        st.rerun()
+    # Rerun to show updated sidebar download buttons or fresh buttons
+    st.rerun()
