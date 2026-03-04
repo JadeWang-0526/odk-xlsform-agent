@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from google.adk.agents import Agent
-# from google.adk.models.lite_llm import LiteLlm
+from google.adk.models.lite_llm import LiteLlm
 from openpyxl import Workbook, load_workbook
 
 # Preferred column orderings to keep XLSForm sheets tidy.
@@ -326,6 +326,9 @@ def _normalize_form_spec(form_spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
       - a dict with optional "columns"/"headers" and a "rows" key, or
       - a list of row dicts (the LLM sometimes passes rows directly as the sheet value).
     """
+    import json as _json
+    if isinstance(form_spec, str):
+        form_spec = _json.loads(form_spec) if form_spec.strip() else {}
     if "sheets" in form_spec and isinstance(form_spec["sheets"], dict):
         sheets = form_spec["sheets"]
     else:
@@ -1008,7 +1011,9 @@ You are odk_xlsform_agent. You help users design or edit ODK XLSForms by followi
 Ask the user: "Do you want to create a new form, or load and edit an existing one?"
 
 **If editing an existing form:**
-- Call `load_xlsform(file_path)` with the path the user provides.
+- The user can either upload the file using the "Load Existing Form" uploader in the sidebar, or provide a file path directly.
+- If the user uploads a file via the sidebar, the app will automatically send you the server-side path — call `load_xlsform(file_path)` with that path immediately.
+- If the user provides a path directly, call `load_xlsform(file_path)` with it. If the path does not exist (e.g. it is a Windows path on a Linux server), ask the user to upload the file via the sidebar instead.
 - Summarize what you loaded: sheet names, row counts, column names, and any choice lists found.
 - Ask the user to confirm that you have loaded the right file and that your summary is accurate.
 - ⏸ Wait here — the user must confirm the correct file was loaded before you make any changes.
