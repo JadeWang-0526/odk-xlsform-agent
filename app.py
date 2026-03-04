@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,8 @@ if "xlsx_files" not in st.session_state:
     st.session_state.xlsx_files = []
 if "button_clicked" not in st.session_state:
     st.session_state.button_clicked = None
+if "injected_uploads" not in st.session_state:
+    st.session_state.injected_uploads = set()
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -70,6 +73,30 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.xlsx_files = []
         st.rerun()
+
+    # File upload — lets Windows users (and anyone else) avoid path problems
+    st.divider()
+    st.subheader("Load Existing Form")
+    uploaded_file = st.file_uploader(
+        "Upload an XLSForm (.xlsx)",
+        type=["xlsx"],
+        help="Upload your existing ODK XLSForm to load and edit it.",
+    )
+    if uploaded_file is not None:
+        upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
+        if upload_key not in st.session_state.injected_uploads:
+            # Save to a server-side temp file so the agent can read it
+            tmp_dir = Path(tempfile.gettempdir()) / "odk_xlsform_uploads"
+            tmp_dir.mkdir(exist_ok=True)
+            tmp_path = tmp_dir / uploaded_file.name
+            tmp_path.write_bytes(uploaded_file.getvalue())
+            st.session_state.injected_uploads.add(upload_key)
+            inject_msg = (
+                f"I have uploaded the form '{uploaded_file.name}'. "
+                f"Please load it from: {tmp_path}"
+            )
+            st.session_state.button_clicked = inject_msg
+            st.rerun()
 
     # Show download buttons for any generated xlsx files
     if st.session_state.xlsx_files:
